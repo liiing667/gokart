@@ -25,6 +25,7 @@ func TestCommandInjection(t *testing.T) {
 		"command_context_injection_safe.go",
 		"command_injection.go",
 		"commandContext.go",
+		"command_injection_callsites.go",
 	}
 
 	// Append directory to each entry
@@ -36,6 +37,7 @@ func TestCommandInjection(t *testing.T) {
 		0,
 		2,
 		2,
+		5,
 	}
 	for i := 0; i < len(testFiles); i++ {
 		t.Run(testFiles[i], func(t *testing.T) {

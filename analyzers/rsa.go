@@ -71,7 +71,10 @@ func EvalConst(expr ssa.Value, cg util.CallGraph) (*ssa.Const, bool) {
 	case *ssa.Parameter:
 		var values []*ssa.Value
 		values = cg.ResolveParam(expr)
-		return EvalConst(*values[0], cg)
+		if len(values) > 0 {
+			return EvalConst(*values[0], cg)
+		}
+		return nil, false
 
 	case *ssa.Phi:
 		var res bool
@@ -135,8 +138,8 @@ func keylen_check(pass *analysis.Pass, keylen ssa.Value, cg util.CallGraph) bool
 	case *ssa.Parameter:
 		var values []*ssa.Value
 		values = cg.ResolveParam(keylen)
-		if len(values) > 0 {
-			unsafe = unsafe || keylen_check(pass, *values[0], cg)
+		for _, value := range values {
+			unsafe = unsafe || keylen_check(pass, *value, cg)
 		}
 	}
 	return unsafe

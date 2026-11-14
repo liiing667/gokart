@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"fmt"
 	"go/token"
+	"go/types"
 	"os"
 	"runtime"
 	"strings"
@@ -60,58 +61,146 @@ type CGRelation struct {
 }
 type CallGraph map[string][]CGRelation
 
+// InvokeKey returns the call graph key under which interface (invoke-mode) calls
+// to a method with the given name are stored
+func InvokeKey(methodName string) string {
+	return "invoke:" + methodName
+}
+
+// InvokeImplKey returns the call graph key under which methods (potential
+// interface implementations) with the given name are registered
+func InvokeImplKey(methodName string) string {
+	return "impl:" + methodName
+}
+
 // AnalyzeFunction updates the CallGraph to contain relations between callee and caller functions. This should be called once on every function in a local package
 func (cg CallGraph) AnalyzeFunction(fn *ssa.Function) {
+	// Register methods so that interface (invoke-mode) calls can be resolved
+	// to their possible implementations
+	if fn.Signature.Recv() != nil {
+		key := InvokeImplKey(fn.Name())
+		cg[key] = append(cg[key], CGRelation{nil, fn})
+	}
 	for _, block := range fn.DomPreorder() {
 		for _, instr := range block.Instrs {
 			switch instr := instr.(type) {
 			case *ssa.Call:
-				if instr.Call.StaticCallee() != nil {
-					calleeName := instr.Call.StaticCallee().String()
+				if callee := instr.Call.StaticCallee(); callee != nil {
 					// Update the callgraph
-					cg[calleeName] = append(cg[calleeName], CGRelation{instr, fn})
+					// Note: StaticCallee resolves direct closure (MakeClosure) calls as well
+					cg[callee.String()] = append(cg[callee.String()], CGRelation{instr, fn})
+				} else if instr.Call.IsInvoke() {
+					// Record interface method calls so that taint can be traced
+					// through dynamic dispatch to the concrete implementations
+					key := InvokeKey(instr.Call.Method.Name())
+					cg[key] = append(cg[key], CGRelation{instr, fn})
 				}
 			}
 		}
 	}
 }
 
+// ParamIndex returns the index of a parameter within its parent function's parameter list, or -1 if not found
+func ParamIndex(p *ssa.Parameter) int {
+	for i, arg := range p.Parent().Params {
+		if p == arg {
+			return i
+		}
+	}
+	return -1
+}
+
 // ResolveParam returns the caller nodes of a parameter. This is used for tracing parameters back to their source.
 func (cg CallGraph) ResolveParam(p *ssa.Parameter) []*ssa.Value {
 	// Determine which argument we are in the parent function
 	pFunc := p.Parent()
-	pIdx := -1
-	for i, arg := range pFunc.Params {
-		if p.Pos() == arg.Pos() {
-			pIdx = i
-		}
+	pIdx := ParamIndex(p)
+	if pIdx < 0 {
+		return nil
 	}
 	// Find all the places the function is called
-	callerNodes := make([]*ssa.Value, len(cg[pFunc.String()]))
-	for i, rel := range cg[pFunc.String()] {
-		callerNodes[i] = &rel.Instr.Call.Args[pIdx]
+	relations := cg[pFunc.String()]
+	// If the parent function is a method, also consider interface (invoke-mode)
+	// call sites whose receiver may dispatch to this implementation
+	if recv := pFunc.Signature.Recv(); recv != nil {
+		relations = append(relations, cg.matchingInvokes(pFunc, recv.Type())...)
+	}
+	callerNodes := make([]*ssa.Value, 0, len(relations))
+	for _, rel := range relations {
+		if rel.Instr.Call.IsInvoke() {
+			// For invoke-mode calls the receiver is the call value itself and
+			// Args holds only the actual parameters
+			if pIdx == 0 {
+				callerNodes = append(callerNodes, &rel.Instr.Call.Value)
+			} else if pIdx-1 < len(rel.Instr.Call.Args) {
+				callerNodes = append(callerNodes, &rel.Instr.Call.Args[pIdx-1])
+			}
+		} else if pIdx < len(rel.Instr.Call.Args) {
+			// Static (method) calls include the receiver as the first argument
+			callerNodes = append(callerNodes, &rel.Instr.Call.Args[pIdx])
+		}
 	}
 	return callerNodes
 }
 
-// Memoize hashes an ssa.Value and then adds it to the Taint Map while updating the metadata
-func (ta TaintAnalyzer) Memoize(val *ssa.Value, vulnerable bool) {
-	switch (*val).(type) {
-	case *ssa.Phi:
-		// Don't want to memoize Phi nodes as recursion will then not check all edges
-	default:
-		// hash the ssa.Value
-		hash := SSAvalToHash(val)
-		// get the current map status
-		map_status := ta.taint_map[hash]
-		// increment the count
-		new_count := map_status.Count + 1
-		// create the new MapData struct
-		mapping := MapData{Mapped: map_status.Mapped, Vulnerable: map_status.Vulnerable, Count: new_count}
-		// update the Taint Map
-		ta.taint_map[hash] = mapping
+// matchingInvokes returns the interface call sites whose receiver type may be
+// implemented by the given method receiver type
+func (cg CallGraph) matchingInvokes(pFunc *ssa.Function, recvType types.Type) []CGRelation {
+	var matches []CGRelation
+	for _, rel := range cg[InvokeKey(pFunc.Name())] {
+		iface, ok := rel.Instr.Call.Value.Type().Underlying().(*types.Interface)
+		if !ok {
+			continue
+		}
+		if types.Implements(recvType, iface) {
+			matches = append(matches, rel)
+			continue
+		}
+		if _, isPtr := recvType.(*types.Pointer); !isPtr && types.Implements(types.NewPointer(recvType), iface) {
+			matches = append(matches, rel)
+		}
 	}
+	return matches
+}
 
+// ResolveInvoke returns the possible implementations of an interface
+// (invoke-mode) method call
+func (cg CallGraph) ResolveInvoke(call *ssa.CallCommon) []*ssa.Function {
+	if !call.IsInvoke() {
+		return nil
+	}
+	iface, ok := call.Value.Type().Underlying().(*types.Interface)
+	if !ok {
+		return nil
+	}
+	var fns []*ssa.Function
+	for _, rel := range cg[InvokeImplKey(call.Method.Name())] {
+		fn := rel.Fn
+		if fn == nil || fn.Signature.Recv() == nil {
+			continue
+		}
+		recvType := fn.Signature.Recv().Type()
+		if types.Implements(recvType, iface) {
+			fns = append(fns, fn)
+			continue
+		}
+		if _, isPtr := recvType.(*types.Pointer); !isPtr && types.Implements(types.NewPointer(recvType), iface) {
+			fns = append(fns, fn)
+		}
+	}
+	return fns
+}
+
+// Memoize adds a TaintKey to the Taint Map while updating the metadata
+func (ta TaintAnalyzer) Memoize(key TaintKey, vulnerable bool) {
+	// get the current map status
+	map_status := ta.taint_map[key]
+	// increment the count
+	new_count := map_status.Count + 1
+	// create the new MapData struct
+	mapping := MapData{Mapped: map_status.Mapped, Vulnerable: map_status.Vulnerable, Count: new_count}
+	// update the Taint Map
+	ta.taint_map[key] = mapping
 }
 
 // SSAvalToHash returns the hash of an ssa.Value to be used in the Taint Map
@@ -129,6 +218,54 @@ func SSAvalToHash(val *ssa.Value) uint64 {
 	// hash the val_string
 	hash := fnv1a.HashString64(val_string)
 	return hash
+}
+
+// TaintKey uniquely identifies an ssa.Value within a specific calling context.
+// Caching taint results per (value, context) pair keeps a verdict computed for
+// one call site from leaking into the analysis of another call site.
+type TaintKey struct {
+	Value   uint64
+	Context uint64
+}
+
+// CallContext is a call-string style stack of the call instructions through
+// which the taint analysis descended into the current function body
+type CallContext []*ssa.Call
+
+// maxContextDepth bounds the length of a CallContext (call-string k-limiting) so
+// that recursive call cycles produce a finite number of distinct contexts
+const maxContextDepth = 4
+
+// PushContext returns a new CallContext with the given call appended, dropping
+// the oldest frame if the context exceeds the maximum depth
+func PushContext(ctx CallContext, call *ssa.Call) CallContext {
+	newCtx := make(CallContext, len(ctx)+1)
+	copy(newCtx, ctx)
+	newCtx[len(ctx)] = call
+	if len(newCtx) > maxContextDepth {
+		newCtx = newCtx[len(newCtx)-maxContextDepth:]
+	}
+	return newCtx
+}
+
+// MatchCallContext returns the index of the innermost context frame that calls
+// the given function, or -1 if there is no such frame
+func MatchCallContext(ctx CallContext, fn *ssa.Function) int {
+	for i := len(ctx) - 1; i >= 0; i-- {
+		if ctx[i].Call.StaticCallee() == fn {
+			return i
+		}
+	}
+	return -1
+}
+
+// HashContext returns a hash of a CallContext to be used in the TaintKey
+func HashContext(ctx CallContext) uint64 {
+	var sb strings.Builder
+	for _, call := range ctx {
+		fmt.Fprintf(&sb, "%p;", call)
+	}
+	return fnv1a.HashString64(sb.String())
 }
 
 // GrabSourceCode retrieves the specified line of source code from the specified file
